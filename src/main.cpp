@@ -2,38 +2,78 @@
 #include <opencv2/highgui.hpp>
 #include <iostream>
 #include <mutex>
+#include <functional>
+#include <thread>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+
 #include "edge_detector.hpp"
+#include "hand_segmenter.hpp"
 #include "thread_pool.hpp"
 
 using namespace cv;
 using namespace std;
 
-std::mutex gui_mutex;
+// GUI task queue
+std::queue<std::function<void()>> guiTasks;
+std::mutex guiQueueMutex;
+std::condition_variable guiQueueCond;
+std::atomic<bool> guiRunning{true};
 
-void showWithLock(const string& windowName, function<void()> showFunc) {
-    std::lock_guard<std::mutex> lock(gui_mutex);
-    showFunc();
-    waitKey(0);
-    destroyWindow(windowName);
+// GUI thread function
+void guiThreadFunc() {
+    while (guiRunning) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(guiQueueMutex);
+            guiQueueCond.wait(lock, [] { return !guiTasks.empty() || !guiRunning; });
+            if (!guiRunning && guiTasks.empty())
+                break;
+            task = std::move(guiTasks.front());
+            guiTasks.pop();
+        }
+        task();  // Show window, waitKey, destroyWindow
+    }
 }
 
-void runLaplacian(Mat img, int instance) {
+// Enqueue a GUI task
+void enqueueGuiTask(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lock(guiQueueMutex);
+        guiTasks.push(std::move(task));
+    }
+    guiQueueCond.notify_one();
+}
+
+// Background edge detection function
+void runEdgeDetection(function<void(EdgeDetector&, const string&)> func, Mat img, int instance, const string& methodName) {
     EdgeDetector detector(img);
-    string windowName = "Laplacian Result " + to_string(instance);
-    // Run processing without GUI lock
-    detector.applyLaplacian(windowName);
+    string windowName = methodName + " Result " + to_string(instance);
 
-    // Protect waitKey & destroyWindow
-    showWithLock(windowName, [](){ /* nothing extra here, imshow called already */ });
+    // Prepare GUI operation as task
+    enqueueGuiTask([detector, windowName, func]() mutable {
+        func(detector, windowName);
+        int key = 0;
+        while (key == 0) {
+            key = waitKey(30);  // Responsive wait
+        }
+        destroyWindow(windowName);
+    });
 }
 
-void runCanny(Mat img, int instance) {
-    EdgeDetector detector(img);
-    string windowName = "Canny Result " + to_string(instance);
-    detector.applyCanny(windowName);
 
-    showWithLock(windowName, [](){});
+void runHandSegmentation(const cv::Mat& img, int instance) {
+    // Create segmenter once here
+    HandSegmenter segmenter(img);
+
+    // Enqueue GUI task that calls segmentAndShow (shows images + waitKey)
+    enqueueGuiTask([segmenter, instance]() mutable {
+        std::string windowName = "Hand Segmentation Result " + std::to_string(instance);
+        segmenter.segmentAndShow(windowName);
+    });
 }
+
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -48,47 +88,92 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    int laplacianCount = 1, cannyCount = 1;
-    ThreadPool pool(thread::hardware_concurrency()); // e.g. 4 or 8 threads
+    ThreadPool pool(thread::hardware_concurrency());
+    std::thread guiThread(guiThreadFunc);  // Start GUI thread
+    int instanceCount = 1;
 
     while (true) {
-        cout << "\n=== Edge Detection Menu ===\n";
-        cout << "1. Laplacian Edge Detection\n";
-        cout << "2. Canny Edge Detection\n";
-        cout << "3. Both\n";
-        cout << "4. Exit\n";
-        cout << "Enter your choice (1-4): ";
+        cout << "\n=== Main Menu ===\n";
+        cout << "1. Edge Detection\n";
+        cout << "2. Hand Segmentation\n";
+        cout << "3. Exit\n";
+        cout << "Enter choice: ";
 
-        int choice;
-        cin >> choice;
-
+        int choiceMain;
+        cin >> choiceMain;
         if (cin.fail()) {
             cin.clear();
             cin.ignore(numeric_limits<streamsize>::max(), '\n');
-            cout << "Invalid input. Please enter a number between 1 and 4.\n";
+            cout << "Invalid input!\n";
             continue;
         }
 
-        switch (choice) {
-            case 1:
-                pool.enqueue(runLaplacian, img.clone(), laplacianCount++);
-                break;
-            case 2:
-                pool.enqueue(runCanny, img.clone(), cannyCount++);
-                break;
-            case 3:
-                pool.enqueue(runLaplacian, img.clone(), laplacianCount++);
-                pool.enqueue(runCanny, img.clone(), cannyCount++);
-                break;
-            case 4:
-                cout << "Exiting...\n";
-                pool.shutdown();
-                return 0;
-            default:
-                cout << "Invalid choice! Please try again.\n";
-                break;
+        if (choiceMain == 3) {
+            cout << "Exiting...\n";
+            break;
         }
 
-        cout << "Detection launched. You can enter another option.\n";
+        if (choiceMain == 1) {
+            while (true) {
+                cout << "\n--- Edge Detection Methods ---\n";
+                cout << "1. Laplacian\n";
+                cout << "2. Canny\n";
+                cout << "3. Sobel\n";
+                cout << "4. Scharr\n";
+                cout << "5. Prewitt\n";
+                cout << "6. Roberts\n";
+                cout << "7. LoG\n";
+                cout << "8. Back to Main Menu\n";
+                cout << "Enter method choice: ";
+
+                int methodChoice;
+                cin >> methodChoice;
+                if (cin.fail()) {
+                    cin.clear();
+                    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+                    cout << "Invalid input!\n";
+                    continue;
+                }
+
+                if (methodChoice == 8)
+                    break;
+
+                function<void(EdgeDetector&, const string&)> func;
+                string methodName;
+
+                switch(methodChoice) {
+                    case 1: func = &EdgeDetector::applyLaplacian; methodName = "Laplacian"; break;
+                    case 2: func = &EdgeDetector::applyCanny; methodName = "Canny"; break;
+                    case 3: func = &EdgeDetector::applySobel; methodName = "Sobel"; break;
+                    case 4: func = &EdgeDetector::applyScharr; methodName = "Scharr"; break;
+                    case 5: func = &EdgeDetector::applyPrewitt; methodName = "Prewitt"; break;
+                    case 6: func = &EdgeDetector::applyRoberts; methodName = "Roberts"; break;
+                    case 7: func = &EdgeDetector::applyLoG; methodName = "LoG"; break;
+                    default:
+                        cout << "Invalid method choice!\n";
+                        continue;
+                }
+
+                pool.enqueue(runEdgeDetection, func, img.clone(), instanceCount++, methodName);
+                cout << "Task launched. You can select another method or return.\n";
+            }
+        } else if (choiceMain == 2) {
+            static int handInstanceCount = 1;
+            pool.enqueue(runHandSegmentation, img.clone(), handInstanceCount++);
+            std::cout << "Hand segmentation task launched.\n";
+        }else {
+                    cout << "Invalid choice!\n";
+                }
+            }
+
+    // Shutdown
+    pool.shutdown();
+    {
+        std::lock_guard<std::mutex> lock(guiQueueMutex);
+        guiRunning = false;
     }
+    guiQueueCond.notify_all();
+    guiThread.join();
+
+    return 0;
 }
