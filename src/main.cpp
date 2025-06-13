@@ -10,6 +10,9 @@
 
 #include "edge_detector.hpp"
 #include "hand_segmenter.hpp"
+#include "color_transfer.hpp"
+#include "contrast_enhancer.hpp"
+
 #include "thread_pool.hpp"
 
 using namespace cv;
@@ -62,6 +65,27 @@ void runEdgeDetection(function<void(EdgeDetector&, const string&)> func, Mat img
     });
 }
 
+void runColorTransfer(const cv::Mat& targetImg, int instance) {
+    // Load style image from fixed path
+    std::string stylePath = "../assets/paint.jpg";  // Or set to your known style image location
+    cv::Mat styleImg = cv::imread(stylePath);
+
+    if (styleImg.empty()) {
+        std::cerr << "Error: Could not load style image from " << stylePath << std::endl;
+        return;
+    }
+
+    ColorTransfer colorTransfer(styleImg, targetImg);
+    cv::Mat result = colorTransfer.applyTransfer();
+
+    enqueueGuiTask([result, instance]() {
+        std::string windowName = "Color Transfer Result " + std::to_string(instance);
+        cv::namedWindow(windowName);
+        cv::imshow(windowName, result);
+        cv::waitKey(0);  // Wait for user to press a key
+        cv::destroyWindow(windowName);
+    });
+}
 
 void runHandSegmentation(const cv::Mat& img, int instance) {
     // Create segmenter once here
@@ -71,6 +95,20 @@ void runHandSegmentation(const cv::Mat& img, int instance) {
     enqueueGuiTask([segmenter, instance]() mutable {
         std::string windowName = "Hand Segmentation Result " + std::to_string(instance);
         segmenter.segmentAndShow(windowName);
+    });
+}
+
+void runContrastEnhancement(const cv::Mat& img, int instance) {
+    ContrastEnhancer enhancer(img);
+    enqueueGuiTask([enhancer, instance]() mutable {
+        std::string windowPrefix = "Contrast Result " + std::to_string(instance);
+        enhancer.enhanceAndShow(windowPrefix);
+
+        // ✅ Wait for key press to keep windows open
+        cv::waitKey(0);
+
+        // ✅ Clean up all windows this task opened
+        cv::destroyAllWindows();
     });
 }
 
@@ -96,7 +134,9 @@ int main(int argc, char** argv) {
         cout << "\n=== Main Menu ===\n";
         cout << "1. Edge Detection\n";
         cout << "2. Hand Segmentation\n";
-        cout << "3. Exit\n";
+        cout << "3. Color Transfer\n";
+        cout << "4. Contrast Enhancer\n";
+        cout << "20. Exit\n";
         cout << "Enter choice: ";
 
         int choiceMain;
@@ -108,7 +148,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        if (choiceMain == 3) {
+        if (choiceMain == 20) {
             cout << "Exiting...\n";
             break;
         }
@@ -161,10 +201,19 @@ int main(int argc, char** argv) {
             static int handInstanceCount = 1;
             pool.enqueue(runHandSegmentation, img.clone(), handInstanceCount++);
             std::cout << "Hand segmentation task launched.\n";
-        }else {
-                    cout << "Invalid choice!\n";
-                }
-            }
+        }else if (choiceMain == 3) {
+            static int _handInstanceCount = 1;
+            pool.enqueue(runColorTransfer, img.clone(), _handInstanceCount++);
+            cout << "Color transfer task launched.\n";
+        } else if (choiceMain == 4) {
+            pool.enqueue(runContrastEnhancement, img.clone(), instanceCount++);
+            cout << "Contrast enhancement task launched.\n";
+        }
+        else 
+        {
+            cout << "Invalid choice!\n";
+        }
+    }
 
     // Shutdown
     pool.shutdown();
